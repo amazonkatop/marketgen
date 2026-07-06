@@ -195,14 +195,21 @@ async def telegram_webhook(update: dict):
     return {"ok": True}
 
 
-def setup_webhook():
+async def setup_webhook():
     webhook_url = f"{APP_BASE_URL}/telegram/webhook"
-    return bot.set_webhook(webhook_url, secret_token=TELEGRAM_WEBHOOK_SECRET)
+    await bot.set_webhook(
+        webhook_url,
+        secret_token=TELEGRAM_WEBHOOK_SECRET,
+    )
 
 
-# @app.on_event("startup")
-# async def on_startup():
-#    await setup_webhook()
+@app.on_event("startup")
+async def on_startup():
+    try:
+        await setup_webhook()
+        print(f"Webhook set to: {APP_BASE_URL}/telegram/webhook")
+    except Exception as e:
+        print(f"Webhook setup failed: {e}")
 
 
 @app.on_event("shutdown")
