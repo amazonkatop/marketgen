@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+aiogram
+pillow
+python-multipart
+python-dotenv
