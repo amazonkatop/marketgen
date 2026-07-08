@@ -1,25 +1,18 @@
 import os
 import io
 import uuid
-import base64
 from dataclasses import dataclass
 from typing import Dict, Optional
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, UploadFile
-from fastapi.responses import JSONResponse, HTMLResponse
-from PIL import Image, ImageDraw, ImageFont, ImageFilter
+from fastapi import FastAPI, File, UploadFile, Header, HTTPException, Request
+from fastapi.responses import JSONResponse, HTMLResponse, Response
+from PIL import Image, ImageDraw, ImageFont
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart, Command
 from aiogram.types import Message, BufferedInputFile, Update
-from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from openai import AsyncOpenAI
-
-ai_client = AsyncOpenAI(
-    api_key=PROXY_API_KEY,
-    base_url="https://api.proxyapi.ru/openai/v1"
-)
 
 
 load_dotenv()
@@ -30,11 +23,20 @@ BOT_USERNAME = os.getenv("BOT_USERNAME")
 APP_BASE_URL = os.getenv("APP_BASE_URL")
 TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET")
 
+if not BOT_TOKEN:
+    raise RuntimeError("Не найден BOT_TOKEN")
+if not APP_BASE_URL:
+    raise RuntimeError("Не найден APP_BASE_URL")
+if not TELEGRAM_WEBHOOK_SECRET:
+    raise RuntimeError("Не найден TELEGRAM_WEBHOOK_SECRET")
 
+ai_client = None
+if PROXY_API_KEY:
+    ai_client = AsyncOpenAI(
+        api_key=PROXY_API_KEY,
+        base_url="https://openai.api.proxyapi.ru/v1",
+    )
 
-# =========================
-# НАСТРОЙКИ И ПАМЯТЬ
-# =========================
 app = FastAPI()
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -82,19 +84,51 @@ def make_preview(image_bytes: bytes) -> bytes:
 
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
+    start_arg = None
+    if message.text:
+        parts = message.text.split(maxsplit=1)
+        if len(parts) > 1:
+            start_arg = parts[1].strip()
+
+    if start_arg and start_arg.startswith("preview_"):
+        preview_id = start_arg.replace("preview_", "", 1)
+        item = DATA.get(preview_id)
+
+        if not item:
+            await message.answer(
+                "Не удалось найти ваш preview. Возможно, сервер перезапускался и временные данные были очищены."
+            )
+            return
+
+        if item.get("preview_bytes"):
+            file_obj = BufferedInputFile(
+                item["preview_bytes"],
+                filename=f"{preview_id}_preview.jpg"
+            )
+            await message.answer_photo(
+                photo=file_obj,
+                caption=f"Ваш preview готов. ID: {preview_id}"
+            )
+            return
+
+        await message.answer(
+            f"Файл найден, но preview еще не готов. ID: {preview_id}"
+        )
+        return
+
     text = (
         "Привет! Это тестовый бот MarketGen AI.\n\n"
         "Команды:\n"
         "/start — старт\n"
-        "/seo — бесплатное SEO-описание\n\n"
-        "Можете отправить фото — я сделаю preview."
+        "/seo НАЗВАНИЕ_ТОВАРА — SEO-описание товара\n\n"
+        "Также можете отправить фото — я сделаю preview."
     )
     await message.answer(text)
 
 
 @dp.message(Command("seo"))
 async def cmd_seo(message: Message):
-    product_name = message.text.replace("/seo", "", 1).strip()
+    product_name = (message.text or "").replace("/seo", "", 1).strip()
 
     if not product_name:
         await message.answer(
@@ -103,27 +137,30 @@ async def cmd_seo(message: Message):
         )
         return
 
+    if not PROXY_API_KEY or ai_client is None:
+        await message.answer(
+            "На сервере не найден PROXY_API_KEY. Проверьте переменные в Railway."
+        )
+        return
+
     await message.answer(
         f"⏳ Генерирую SEO-описание для товара: {product_name}"
     )
 
     try:
-        ai_client = AsyncOpenAI(
-            api_key=PROXY_API_KEY,
-            base_url="https://api.proxyapi.ru/openai/v1"
-        )
-
         response = await ai_client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="openai/gpt-4o-mini",
             messages=[
                 {
                     "role": "system",
                     "content": (
-                        "Ты профессиональный копирайтер для маркетплейсов. "
-                        "Пиши по-русски. "
+                        "Ты профессиональный копирайтер для маркетплейсов Wildberries и Ozon. "
+                        "Пиши только по-русски. "
+                        "Сделай структурированный и продающий текст без выдуманных характеристик. "
+                        "Если данных о товаре мало, не придумывай факты, а пиши нейтрально. "
                         "Структура ответа: "
                         "1) Название, "
-                        "2) Характеристики, "
+                        "2) Характеристики (3-5 пунктов), "
                         "3) Продающее описание, "
                         "4) SEO-ключи."
                     )
@@ -133,10 +170,14 @@ async def cmd_seo(message: Message):
                     "content": f"Сделай SEO-описание для товара: {product_name}"
                 }
             ],
-            temperature=0.7
+            temperature=0.7,
         )
 
         ai_text = response.choices[0].message.content
+        if not ai_text:
+            await message.answer("ИИ вернул пустой ответ. Попробуйте еще раз.")
+            return
+
         await message.answer(ai_text)
 
     except Exception as e:
@@ -144,7 +185,6 @@ async def cmd_seo(message: Message):
         await message.answer(
             "К сожалению, произошла ошибка при обращении к ИИ. Попробуйте позже."
         )
-
 
 
 @dp.message(F.photo)
@@ -237,16 +277,23 @@ async def api_status(preview_id: str):
 
 
 @app.post("/telegram/webhook")
-async def telegram_webhook(update: dict):
-    telegram_update = Update.model_validate(update)
+async def telegram_webhook(
+    request: Request,
+    x_telegram_bot_api_secret_token: Optional[str] = Header(default=None),
+):
+    if x_telegram_bot_api_secret_token != TELEGRAM_WEBHOOK_SECRET:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    update_data = await request.json()
+    telegram_update = Update.model_validate(update_data)
     await dp.feed_update(bot, telegram_update)
-    return {"ok": True}
+    return Response(content='{"ok":true}', media_type="application/json")
 
 
 async def setup_webhook():
     webhook_url = f"{APP_BASE_URL}/telegram/webhook"
     await bot.set_webhook(
-        webhook_url,
+        url=webhook_url,
         secret_token=TELEGRAM_WEBHOOK_SECRET,
     )
 
