@@ -4,3 +4,4 @@ aiogram
 pillow
 python-multipart
 python-dotenv
+openai

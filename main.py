@@ -14,6 +14,7 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart, Command
 from aiogram.types import Message, BufferedInputFile, Update
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
+from openai import AsyncOpenAI
 
 load_dotenv()
 
@@ -87,16 +88,43 @@ async def cmd_start(message: Message):
 
 @dp.message(Command("seo"))
 async def cmd_seo(message: Message):
-    await message.answer(
-        "SEO-описание бесплатно:\n\n"
-        "Название: Товар для маркетплейса\n\n"
-        "Характеристики:\n"
-        "- Качественный товар\n"
-        "- Удобен в использовании\n"
-        "- Подходит для ежедневного применения\n\n"
-        "Описание: Это тестовый SEO-блок для проверки работы бота.\n\n"
-        "LSI: товар, маркетплейс, описание, характеристики"
-    )
+    # 1. Берем текст, который пользователь написал после команды /seo
+    # Например: "/seo кожаный кошелек" -> товар будет "кожаный кошелек"
+    product_name = message.text.replace("/seo", "").strip()
+
+    if not product_name:
+        await message.answer(
+            "Пожалуйста, укажите название товара после команды.\n"
+            "Пример: `/seo Кожаный мужской кошелек`"
+        )
+        return
+
+    await message.answer(f"⏳ Генерирую SEO-описание для товара «{product_name}»... Пожалуйста, подождите.")
+
+    try:
+        # 2. Подключаемся к ИИ, используя ваш ключ из Railway
+        ai_client = AsyncOpenAI(
+            api_key=PROXY_API_KEY,
+            base_url="https://api.proxyapi.ru/v1" # Адрес шлюза ProxyAPI
+        )
+
+        # 3. Отправляем запрос нейросети
+        response = await ai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "Ты профессиональный копирайтер для маркетплейсов (Wildberries, Ozon). Твоя задача — составить продающее SEO-описание товара с ключевыми словами и LSI."},
+                {"role": "user", "content": f"Напиши SEO-описание для товара: {product_name}. Структурируй ответ: Название, Характеристики (3-4 пункта), Продающее описание, Блок LSI-ключей."}
+            ]
+        )
+
+        # 4. Забираем готовый текст и отправляем пользователю
+        ai_text = response.choices[0].message.content
+        await message.answer(ai_text)
+
+    except Exception as e:
+        print(f"Ошибка ИИ: {e}")
+        await message.answer("К сожалению, произошла ошибка при обращении к ИИ. Попробуйте позже.")
+
 
 
 @dp.message(F.photo)
