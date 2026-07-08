@@ -1,568 +1,645 @@
 import os
 import io
+import re
 import uuid
+import json
 import base64
+import asyncio
+import textwrap
 import logging
-from datetime import datetime, timedelta, timezone
-from typing import Optional, Dict, Any
+from dataclasses import dataclass
+from typing import Dict, Optional, List
 
-from fastapi import FastAPI, File, UploadFile, Form, Header, HTTPException, Request, Depends
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from dotenv import load_dotenv
+from fastapi import FastAPI, File, UploadFile, Header, HTTPException, Form
+from fastapi.responses import JSONResponse
 from PIL import Image, ImageDraw, ImageFont
 
-from aiogram import Bot, Dispatcher, types, F
-from aiogram.types import Message, BufferedInputFile, LabeledPrice, PreCheckoutQuery, ContentType
-from aiogram.filters import Command, CommandObject
+from aiogram import Bot, Dispatcher
+from aiogram.filters import CommandStart, CommandObject, Command
+from aiogram.types import Message, BufferedInputFile, Update
 from aiogram.utils.deep_linking import create_start_link
 
 from openai import AsyncOpenAI
 
-# ---------------------------------------------------------------------------
-# 1. СТРУКТУРНОЕ ЛОГИРОВАНИЕ И НАСТРОЙКИ ОБЪЕКТОВ
-# ---------------------------------------------------------------------------
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger(__name__)
+load_dotenv()
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("marketgen-bot")
 
-# Чтение конфигурации из переменных окружения Railway
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-BOT_USERNAME = os.getenv("BOT_USERNAME", "marketgen_bot")
-APP_BASE_URL = os.getenv("APP_BASE_URL")
-TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET")
-
 PROXY_API_KEY = os.getenv("PROXY_API_KEY")
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.proxyapi.ru/openai/v1")
-OPENAI_MODEL_TEXT = os.getenv("OPENAI_MODEL_TEXT", "deepseek-chat")
-OPENAI_MODEL_IMAGE = os.getenv("OPENAI_MODEL_IMAGE", "flux-schnell")
+BOT_USERNAME = os.getenv("BOT_USERNAME")
+APP_BASE_URL = os.getenv("APP_BASE_URL")
+TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "")
+ALLOWED_API_TOKEN = os.getenv("ALLOWED_API_TOKEN", "")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
-ALLOWED_API_TOKEN = os.getenv("ALLOWED_API_TOKEN")
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN не найден в переменных окружения")
 
-if not BOT_TOKEN or not APP_BASE_URL or not TELEGRAM_WEBHOOK_SECRET:
-    raise RuntimeError("Критические переменные окружения BOT_TOKEN, APP_BASE_URL или TELEGRAM_WEBHOOK_SECRET не заданы!")
+if not APP_BASE_URL:
+    raise RuntimeError("APP_BASE_URL не найден в переменных окружения")
 
-# Инициализация ИИ-клиента
-ai_client = None
-if PROXY_API_KEY:
-    ai_client = AsyncOpenAI(api_key=PROXY_API_KEY, base_url=OPENAI_BASE_URL)
-
-# Инициализация компонентов aiogram
+app = FastAPI(title="MarketGen AI")
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# Инициализация FastAPI приложения
-app = FastAPI(title="MarketGen AI Monolith Backend")
+ai_client: Optional[AsyncOpenAI] = None
+if PROXY_API_KEY:
+    ai_client = AsyncOpenAI(
+        api_key=PROXY_API_KEY,
+        base_url=OPENAI_BASE_URL,
+    )
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+DATA: Dict[str, "Generation"] = {}
 
-# ---------------------------------------------------------------------------
-# 2. ОПТИМИЗИРОВАННЫЙ СЛОЙ БД (MOCK-АДАПТЕР ДЛЯ МИГРАЦИИ НА POSTGRESQL)
-# ---------------------------------------------------------------------------
-# Чтобы MVP запустился до развертывания миграций Alembic,
-# мы имитируем персистентную структуру таблиц 'users', 'generations', 'payments'
-# Данные объекты будут бесшовно заменены на СУБД-модели SQLAlchemy.
-DB_USERS: Dict[int, Dict[str, Any]] = {}
-DB_GENERATIONS: Dict[str, Dict[str, Any]] = {}
-DB_PAYMENTS: Dict[str, Dict[str, Any]] = {}
 
-def get_or_create_user(tg_id: int, username: Optional[str] = None, first_name: Optional[str] = None, source_tag: Optional[str] = None):
-    if tg_id not in DB_USERS:
-        DB_USERS[tg_id] = {
-            "telegram_id": tg_id,
-            "username": username,
-            "first_name": first_name,
-            "source_tag": source_tag or "unknown",
-            "free_generations_left": 1,
-            "is_subscribed": False,
-            "subscription_expires_at": None,
-            "credits_left": 0,
-            "created_at": datetime.now(timezone.utc)
-        }
-    else:
-        if source_tag and DB_USERS[tg_id]["source_tag"] == "unknown":
-            DB_USERS[tg_id]["source_tag"] = source_tag
-    return DB_USERS[tg_id]
+@dataclass
+class Generation:
+    preview_id: str
+    marketplace: str
+    description: str
+    input_bytes: bytes
+    filename: str
+    mime_type: str
+    preview_bytes: Optional[bytes] = None
+    final_image_bytes: Optional[bytes] = None
+    seo_text: Optional[str] = None
+    facts_json: Optional[dict] = None
+    infographic_labels: Optional[List[str]] = None
+    status: str = "uploaded"
+    error: Optional[str] = None
 
-# ---------------------------------------------------------------------------
-# 3. ВСПОМОГАТЕЛЬНЫЕ СЛУЖБЫ ОЧИСТКИ ФОНА И РЕНДЕРИНГА PILLOW
-# ---------------------------------------------------------------------------
-def try_remove_background_simple(img: Image.Image) -> Image.Image:
-    """Удаление однотонного фона по замеру угловых пикселей."""
-    try:
-        img = img.convert("RGBA")
-        datas = img.getdata()
-        bg_color = datas[0] # Верхний левый угол
-        
-        new_data = []
-        for item in datas:
-            # Если пиксель близок к угловому цвету — делаем его прозрачным
-            if abs(item[0] - bg_color[0]) < 30 and abs(item[1] - bg_color[1]) < 30 and abs(item[2] - bg_color[2]) < 30:
-                new_data.append((255, 255, 255, 0))
-            else:
-                new_data.append(item)
-        img.putdata(new_data)
-        return img
-    except Exception as e:
-        logger.error(f"Background removal skipped: {e}")
-        return img
 
-def render_infographic(original_bytes: bytes, marketplace: str, text_label: str) -> bytes:
-    """Генерация карточки товара с адаптацией холста и наложением плашек вотермарка."""
-    try:
-        img = Image.open(io.BytesIO(original_bytes))
-        
-        # Шаг 1. Адаптация холста под требования маркетплейса
-        if marketplace.lower() == "wildberries":
-            target_size = (900, 1200) # Пропорция 3:4
+def normalize_marketplace(value: str) -> str:
+    value = (value or "").strip().lower()
+    aliases = {
+        "wb": "wildberries",
+        "wildberries": "wildberries",
+        "ozon": "ozon",
+    }
+    return aliases.get(value, "")
+
+
+def ensure_authorized(x_api_token: Optional[str]):
+    if ALLOWED_API_TOKEN and x_api_token != ALLOWED_API_TOKEN:
+        raise HTTPException(status_code=401, detail="unauthorized")
+
+
+def resize_and_center(image: Image.Image, target: tuple[int, int]) -> Image.Image:
+    image = image.convert("RGBA")
+    canvas = Image.new("RGBA", target, (248, 248, 248, 255))
+
+    ratio = min(target[0] / image.width, target[1] / image.height)
+    new_size = (
+        max(1, int(image.width * ratio)),
+        max(1, int(image.height * ratio)),
+    )
+    resized = image.resize(new_size)
+
+    x = (target[0] - resized.width) // 2
+    y = (target[1] - resized.height) // 2
+    canvas.alpha_composite(resized, (x, y))
+    return canvas
+
+
+def wrap_text(draw: ImageDraw.ImageDraw, text: str, font, max_width: int) -> List[str]:
+    words = text.split()
+    lines = []
+    current = ""
+
+    for word in words:
+        candidate = f"{current} {word}".strip()
+        bbox = draw.textbbox((0, 0), candidate, font=font)
+        if bbox[2] - bbox[0] <= max_width:
+            current = candidate
         else:
-            target_size = (1200, 1200) # Квадрат Ozon
-            
-        img = try_remove_background_simple(img)
-        
-        # Создание стильного темного фона подложки (соответствие UI)
-        canvas = Image.new("RGBA", target_size, (15, 23, 42, 255)) 
-        
-        # Изменение размеров оригинального объекта с сохранением пропорций
-        img.thumbnail((target_size[0] - 100, target_size[1] - 200), Image.Resampling.LANCZOS)
-        
-        # Центрирование товара на холсте
-        offset_x = (target_size[0] - img.size[0]) // 2
-        offset_y = (target_size[1] - img.size[1]) // 2 + 50
-        canvas.alpha_composite(img, (offset_x, offset_y))
-        
-        # Наложение информационного вотермарка
-        draw = ImageDraw.Draw(canvas)
-        watermark_text = f"MarketGen AI • Preview [{marketplace.upper()}]"
-        
-        # Отрисовка декоративной плашки УТП вверху безопасной зоны
-        draw.rectangle([(40, 40), (target_size[0] - 40, 110)], fill=(30, 41, 59, 230), outline=(99, 102, 241), width=2)
-        draw.text((60, 55), text_label, fill=(255, 255, 255, 255))
-        
-        # Нижний технический вотермарк защиты
-        draw.text((40, target_size[1] - 50), watermark_text, fill=(148, 163, 184, 180))
-        
-        output = io.BytesIO()
-        canvas.convert("RGB").save(output, format="JPEG", quality=85)
-        return output.getvalue()
-    except Exception as e:
-        logger.error(f"Pillow rendering failed: {e}")
-        return original_bytes
+            if current:
+                lines.append(current)
+            current = word
 
-# ---------------------------------------------------------------------------
-# 4. ФОНОВЫЕ ИНТЕГРАЦИОННЫЕ ИИ-ТАСКИ (PROXYAPI)
-# ---------------------------------------------------------------------------
-async def generate_ai_bundle_task(preview_id: str, description_input: str, original_bytes: bytes, marketplace: str):
-    """Фоновый асинхронный конвейер полной генерации текстов и картинок через ИИ."""
-    gen = DB_GENERATIONS.get(preview_id)
-    if not gen:
-        return
-        
-    try:
-        gen["status"] = "preview_generating"
-        
-        # Имитируем парсинг фич для плашек. В будущем — извлечение через vision-запрос
-        extracted_label = "🔥 ХИТ ПРОДАЖ • ПРЕМИУМ КАЧЕСТВО"
-        
-        # Отрисовка демо-превью
-        preview_img = render_infographic(original_bytes, marketplace, extracted_label)
-        gen["preview_photo_bytes"] = preview_img
-        gen["status"] = "preview_ready"
-        
-        if not ai_client:
-            logger.warning("PROXY_API_KEY не задан. Полная генерация ИИ пропущена.")
-            return
+    if current:
+        lines.append(current)
 
-        # 1. Текстовая SEO-генерация карточки (Модель: deepseek-chat)
-        gen["status"] = "full_generating"
-        system_prompt = (
-            "Ты — ведущий эксперт по SEO для маркетплейсов Wildberries и Ozon. "
-            "Твоя цель — составить карточку товара на основе описания пользователя. "
-            "Запрещено выдумывать факты, которых нет в описании! Структурируй ответ в Markdown."
+    return lines[:3]
+
+
+def try_remove_background_simple(image: Image.Image) -> Image.Image:
+    image = image.convert("RGBA")
+    bg = Image.new("RGBA", image.size, (255, 255, 255, 0))
+
+    corners = [
+        image.getpixel((0, 0)),
+        image.getpixel((image.width - 1, 0)),
+        image.getpixel((0, image.height - 1)),
+        image.getpixel((image.width - 1, image.height - 1)),
+    ]
+    avg = tuple(sum(p[i] for p in corners) // 4 for i in range(4))
+
+    result = Image.new("RGBA", image.size)
+    for y in range(image.height):
+        for x in range(image.width):
+            px = image.getpixel((x, y))
+            diff = abs(px[0] - avg[0]) + abs(px[1] - avg[1]) + abs(px[2] - avg[2])
+            if diff < 45:
+                result.putpixel((x, y), (255, 255, 255, 0))
+            else:
+                result.putpixel((x, y), px)
+
+    bg.alpha_composite(result)
+    return bg
+
+
+def marketplace_canvas(marketplace: str) -> tuple[int, int]:
+    if marketplace == "wildberries":
+        return (900, 1200)
+    return (1200, 1200)
+
+
+def make_preview(image_bytes: bytes, marketplace: str = "generic") -> bytes:
+    image = Image.open(io.BytesIO(image_bytes)).convert("RGBA")
+    target = marketplace_canvas(marketplace if marketplace in {"wildberries", "ozon"} else "ozon")
+    canvas = resize_and_center(image, target)
+
+    overlay = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    font = ImageFont.load_default()
+
+    badge = f"MarketGen AI • {marketplace.title()} Preview"
+    bbox = draw.textbbox((0, 0), badge, font=font)
+    text_w = bbox[2] - bbox[0]
+    text_h = bbox[3] - bbox[1]
+
+    bx = max(20, (canvas.size[0] - text_w) // 2)
+    by = canvas.size[1] - text_h - 40
+
+    draw.rounded_rectangle(
+        (bx - 18, by - 12, bx + text_w + 18, by + text_h + 12),
+        radius=18,
+        fill=(0, 0, 0, 145),
+    )
+    draw.text((bx, by), badge, fill=(255, 255, 255, 255), font=font)
+
+    merged = Image.alpha_composite(canvas, overlay)
+    buf = io.BytesIO()
+    merged.convert("RGB").save(buf, format="JPEG", quality=92)
+    return buf.getvalue()
+
+
+def render_infographic(
+    image_bytes: bytes,
+    marketplace: str,
+    labels: List[str],
+    title: str | None = None,
+) -> bytes:
+    target = marketplace_canvas(marketplace)
+    base = Image.open(io.BytesIO(image_bytes)).convert("RGBA")
+    product = try_remove_background_simple(base)
+    product = resize_and_center(product, (int(target[0] * 0.72), int(target[1] * 0.72)))
+
+    canvas = Image.new("RGBA", target, (250, 250, 248, 255))
+    shadow = Image.new("RGBA", target, (0, 0, 0, 0))
+    sdraw = ImageDraw.Draw(shadow)
+
+    cx = (target[0] - product.width) // 2
+    cy = int(target[1] * 0.18)
+
+    sdraw.ellipse(
+        (
+            cx + 80,
+            cy + product.height - 40,
+            cx + product.width - 80,
+            cy + product.height + 35,
+        ),
+        fill=(0, 0, 0, 40),
+    )
+    canvas = Image.alpha_composite(canvas, shadow)
+    canvas.alpha_composite(product, (cx, cy))
+
+    draw = ImageDraw.Draw(canvas)
+    font = ImageFont.load_default()
+    title = (title or "").strip()[:64]
+
+    if title:
+        lines = wrap_text(draw, title, font, target[0] - 120)
+        y = 36
+        for line in lines:
+            bbox = draw.textbbox((0, 0), line, font=font)
+            tw = bbox[2] - bbox[0]
+            th = bbox[3] - bbox[1]
+            tx = (target[0] - tw) // 2
+            draw.rounded_rectangle(
+                (tx - 12, y - 8, tx + tw + 12, y + th + 8),
+                radius=12,
+                fill=(255, 255, 255, 220),
+                outline=(225, 225, 225, 255),
+            )
+            draw.text((tx, y), line, fill=(20, 20, 20, 255), font=font)
+            y += th + 18
+
+    cleaned = [re.sub(r"\s+", " ", (x or "").strip())[:28] for x in labels if (x or "").strip()]
+    cleaned = cleaned[:5]
+
+    positions = [
+        (34, 180),
+        (target[0] - 250, 220),
+        (34, target[1] - 240),
+        (target[0] - 250, target[1] - 280),
+        ((target[0] - 220) // 2, target[1] - 160),
+    ]
+
+    for i, text in enumerate(cleaned):
+        x, y = positions[i]
+        bbox = draw.textbbox((0, 0), text, font=font)
+        tw = bbox[2] - bbox[0]
+        th = bbox[3] - bbox[1]
+        draw.rounded_rectangle(
+            (x, y, x + tw + 32, y + th + 22),
+            radius=16,
+            fill=(17, 17, 17, 235),
         )
-        user_prompt = f"Сделай SEO-пакет для маркетплейса {marketplace}. Товар: {description_input}"
-        
+        draw.text((x + 16, y + 11), text, fill=(255, 255, 255, 255), font=font)
+
+    out = io.BytesIO()
+    canvas.convert("RGB").save(out, format="JPEG", quality=93)
+    return out.getvalue()
+
+
+def image_to_data_url(image_bytes: bytes, mime_type: str) -> str:
+    encoded = base64.b64encode(image_bytes).decode("utf-8")
+    return f"data:{mime_type};base64,{encoded}"
+
+
+async def extract_facts_and_seo(item: Generation):
+    if not ai_client:
+        item.status = "failed"
+        item.error = "AI client is not configured"
+        return
+
+    item.status = "analyzing"
+
+    try:
+        image_data_url = image_to_data_url(item.input_bytes, item.mime_type)
+
+        system_prompt = (
+            "Ты помощник селлера маркетплейсов Wildberries и Ozon. "
+            "Пиши строго по-русски. "
+            "Нельзя галлюцинировать. "
+            "Используй только факты из описания пользователя и визуально очевидные признаки на фото. "
+            "Если факт не подтвержден текстом пользователя или явно не виден на фото, не выдумывай его. "
+            "Если характеристика не подтверждена, помечай ее как 'не уточнено' во внутреннем анализе, "
+            "но не добавляй ее в итоговый продающий текст как факт."
+        )
+
+        user_text = f"""
+Проанализируй фото товара и описание пользователя.
+
+Маркетплейс: {item.marketplace}
+
+Описание пользователя:
+{item.description}
+
+Верни результат СТРОГО в JSON формате по этой схеме:
+{{
+  "confirmed_facts": [
+    "..."
+  ],
+  "uncertain_facts": [
+    "..."
+  ],
+  "infographic_labels": [
+    "короткая плашка 1",
+    "короткая плашка 2",
+    "короткая плашка 3"
+  ],
+  "product_title": "заголовок товара",
+  "characteristics": [
+    "характеристика 1",
+    "характеристика 2"
+  ],
+  "sales_description": "продающее описание",
+  "seo_keywords": [
+    "ключ 1",
+    "ключ 2"
+  ],
+  "lsi_phrases": [
+    "lsi 1",
+    "lsi 2"
+  ]
+}}
+
+Ограничения:
+- infographic_labels: от 3 до 5 коротких плашек, максимум 4 слова в каждой.
+- product_title: без выдуманного бренда, без неподтвержденной совместимости.
+- characteristics: только подтвержденные факты.
+- sales_description: 600-1000 символов, без фантазий.
+- seo_keywords и lsi_phrases: только релевантные подтвержденному товару.
+- Если описание скудное, лучше сделать более сдержанный текст, чем выдумать детали.
+- Верни только JSON, без markdown и без пояснений.
+""".strip()
+
         response = await ai_client.chat.completions.create(
-            model=OPENAI_MODEL_TEXT,
+            model=OPENAI_MODEL,
+            temperature=0.2,
+            response_format={"type": "json_object"},
             messages=[
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": user_text},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": image_data_url},
+                        },
+                    ],
+                },
             ],
-            temperature=0.3
         )
-        gen["seo_text"] = response.choices[0].message.content
-        
-        # В реальной продакшн-версии здесь запускается 4 параллельных таска через ai_client.images.generate
-        # под управлением модели flux-schnell для формирования 4 HD-слайдов.
-        gen["output_photo_bytes"] = original_bytes # Для MVP в качестве HD-файла передаем оригинал
-        gen["status"] = "full_ready"
-        logger.info(f"Сборка карточки {preview_id} успешно завершена!")
-        
-    except Exception as e:
-        logger.error(f"Сбой ИИ-конвейера: {e}")
-        gen["status"] = "failed"
 
-# ---------------------------------------------------------------------------
-# 5. FASTAPI REST ENDPOINTS (КОНТРАКТ ДЛЯ LANDING САТЕЛЛИТОВ)
-# ---------------------------------------------------------------------------
-def ensure_authorized(x_api_token: Optional[str] = Header(default=None)):
-    if ALLOWED_API_TOKEN and x_api_token != ALLOWED_API_TOKEN:
-        raise HTTPException(status_code=401, detail="Unauthorized API token.")
+        raw = (response.choices[0].message.content or "").strip()
+        if not raw:
+            item.status = "failed"
+            item.error = "AI returned empty JSON"
+            return
+
+        parsed = json.loads(raw)
+        item.facts_json = parsed
+
+        labels = parsed.get("infographic_labels") or []
+        title = (parsed.get("product_title") or "").strip()
+
+        characteristics = parsed.get("characteristics") or []
+        sales_description = (parsed.get("sales_description") or "").strip()
+        seo_keywords = parsed.get("seo_keywords") or []
+        lsi_phrases = parsed.get("lsi_phrases") or []
+        confirmed_facts = parsed.get("confirmed_facts") or []
+        uncertain_facts = parsed.get("uncertain_facts") or []
+
+        seo_text = []
+        seo_text.append("1. Название товара")
+        seo_text.append(title or "Не удалось сформировать название без риска искажения фактов.")
+        seo_text.append("")
+        seo_text.append("2. Подтвержденные факты")
+        seo_text.extend(f"- {x}" for x in confirmed_facts[:15] if str(x).strip())
+        seo_text.append("")
+        seo_text.append("3. Характеристики")
+        seo_text.extend(f"- {x}" for x in characteristics[:15] if str(x).strip())
+        seo_text.append("")
+        seo_text.append("4. Продающее описание")
+        seo_text.append(sales_description or "Описание не сформировано.")
+        seo_text.append("")
+        seo_text.append("5. SEO-ключи")
+        seo_text.append(", ".join([str(x).strip() for x in seo_keywords if str(x).strip()]) or "Нет данных")
+        seo_text.append("")
+        seo_text.append("6. LSI-фразы")
+        seo_text.append(", ".join([str(x).strip() for x in lsi_phrases if str(x).strip()]) or "Нет данных")
+
+        if uncertain_facts:
+            seo_text.append("")
+            seo_text.append("7. Что не было подтверждено")
+            seo_text.extend(f"- {x}" for x in uncertain_facts[:10] if str(x).strip())
+
+        item.seo_text = "\n".join(seo_text).strip()
+        item.infographic_labels = labels[:5]
+        item.final_image_bytes = render_infographic(
+            image_bytes=item.input_bytes,
+            marketplace=item.marketplace,
+            labels=item.infographic_labels or ["Фото товара", "На основе фактов", "Под формат площадки"],
+            title=title,
+        )
+        item.status = "ready"
+
+    except Exception as e:
+        logger.exception("AI generation error")
+        item.status = "failed"
+        item.error = str(e)
+
+
+@app.on_event("startup")
+async def on_startup():
+    webhook_url = f"{APP_BASE_URL.rstrip('/')}/telegram/webhook"
+    await bot.set_webhook(
+        webhook_url,
+        secret_token=TELEGRAM_WEBHOOK_SECRET or None,
+    )
+    logger.info("Webhook set to %s", webhook_url)
+
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    await bot.delete_webhook(drop_pending_updates=False)
+    await bot.session.close()
+
+
+@app.get("/health")
+async def health():
+    return {
+        "ok": True,
+        "bot_username": BOT_USERNAME,
+        "openai_configured": bool(PROXY_API_KEY),
+        "tasks_in_memory": len(DATA),
+    }
+
+
+@app.post("/telegram/webhook")
+async def telegram_webhook(
+    update: dict,
+    x_telegram_bot_api_secret_token: str | None = Header(default=None),
+):
+    if TELEGRAM_WEBHOOK_SECRET and x_telegram_bot_api_secret_token != TELEGRAM_WEBHOOK_SECRET:
+        raise HTTPException(status_code=403, detail="forbidden")
+
+    telegram_update = Update.model_validate(update)
+    await dp.feed_update(bot, telegram_update)
+    return {"ok": True}
+
 
 @app.post("/api/upload")
 async def api_upload(
     file: UploadFile = File(...),
     description: str = Form(...),
     marketplace: str = Form(...),
-    x_api_token: Optional[str] = Header(default=None)
+    x_api_token: str | None = Header(default=None),
 ):
     ensure_authorized(x_api_token)
-    
-    if len(description.strip()) < 5:
-        raise HTTPException(status_code=400, detail="Description must be at least 5 characters long.")
-        
-    if marketplace.lower() not in ["wildberries", "ozon"]:
-        raise HTTPException(status_code=400, detail="Invalid marketplace value. Use 'wildberries' or 'ozon'.")
-        
-    preview_id = str(uuid.uuid4())[:12]
-    file_bytes = await file.read()
-    
-    # Регистрация объекта сессии в персистентной таблице БД
-    DB_GENERATIONS[preview_id] = {
-        "id": str(uuid.uuid4()),
-        "preview_id": preview_id,
-        "user_id": None, # Привяжется, когда пользователь перейдет по deep-link
-        "description_input": description,
-        "marketplace": marketplace.lower(),
-        "original_photo_bytes": file_bytes,
-        "preview_photo_bytes": None,
-        "output_photo_bytes": None,
-        "seo_text": None,
-        "status": "uploaded",
-        "is_paid_generation": False,
-        "created_at": datetime.now(timezone.utc)
-    }
-    
-    # Генерация безопасной глубокой ссылки
-    telegram_link = f"https://t.me/{BOT_USERNAME}?start=preview_{preview_id}"
-    
-    # Запуск фонового рендеринга и ИИ-анализа, чтобы веб-сервер мгновенно вернул ответ фронтенду
-    import asyncio
-    asyncio.create_task(generate_ai_bundle_task(preview_id, description, file_bytes, marketplace))
-    
+
+    if not BOT_USERNAME:
+        return JSONResponse(
+            status_code=500,
+            content={"ok": False, "error": "BOT_USERNAME is not configured"},
+        )
+
+    content = await file.read()
+    description = (description or "").strip()
+    marketplace = normalize_marketplace(marketplace)
+
+    if not content:
+        return JSONResponse(
+            status_code=400,
+            content={"ok": False, "error": "empty file"},
+        )
+
+    if len(description) < 5:
+        return JSONResponse(
+            status_code=400,
+            content={"ok": False, "error": "description is too short"},
+        )
+
+    if marketplace not in {"wildberries", "ozon"}:
+        return JSONResponse(
+            status_code=400,
+            content={"ok": False, "error": "unsupported marketplace"},
+        )
+
+    content_type = (file.content_type or "").lower()
+    if content_type not in {"image/jpeg", "image/jpg", "image/png", "image/webp"}:
+        return JSONResponse(
+            status_code=400,
+            content={"ok": False, "error": "unsupported file type"},
+        )
+
+    preview_id = uuid.uuid4().hex[:12]
+    preview_bytes = make_preview(content, marketplace=marketplace)
+
+    item = Generation(
+        preview_id=preview_id,
+        marketplace=marketplace,
+        description=description,
+        input_bytes=content,
+        filename=file.filename or f"{preview_id}.jpg",
+        mime_type=content_type if content_type != "image/jpg" else "image/jpeg",
+        preview_bytes=preview_bytes,
+        status="uploaded",
+    )
+    DATA[preview_id] = item
+
+    deep_link = await create_start_link(bot, f"preview_{preview_id}", encode=False)
+    asyncio.create_task(extract_facts_and_seo(item))
+
     return {
-        "success": True,
         "ok": True,
         "preview_id": preview_id,
-        "telegram_link": telegram_link,
-        "status": "uploaded"
+        "telegram_link": deep_link,
+        "status": item.status,
     }
+
 
 @app.get("/api/status/{preview_id}")
-async def api_status(preview_id: str):
-    gen = DB_GENERATIONS.get(preview_id)
-    if not gen:
-        raise HTTPException(status_code=404, detail="Generation session not found.")
+async def api_status(preview_id: str, x_api_token: str | None = Header(default=None)):
+    ensure_authorized(x_api_token)
+
+    item = DATA.get(preview_id)
+    if not item:
+        return JSONResponse(status_code=404, content={"ok": False, "error": "not found"})
+
     return {
-        "preview_id": gen["preview_id"],
-        "status": gen["status"],
-        "has_seo": gen["seo_text"] is not None
+        "ok": True,
+        "preview_id": item.preview_id,
+        "status": item.status,
+        "marketplace": item.marketplace,
+        "has_preview": bool(item.preview_bytes),
+        "has_final": bool(item.final_image_bytes),
+        "has_seo": bool(item.seo_text),
+        "error": item.error,
     }
 
-@app.get("/health")
-async def health_check():
-    return {"status": "healthy", "bot_username": BOT_USERNAME, "active_sessions": len(DB_GENERATIONS)}
 
-# ---------------------------------------------------------------------------
-# 6. AIOGRAM TELEGRAM BOT (ОБРАБОТКА ДВУХ СЦЕНАРИЕВ: ЛЕНДИНГ И КАНАЛ)
-# ---------------------------------------------------------------------------
+@dp.message(CommandStart(deep_link=True))
+async def cmd_start_with_payload(message: Message, command: CommandObject):
+    args = (command.args or "").strip()
 
-@dp.message(Command("start"))
-async def cmd_start(message: Message, command: CommandObject):
-    args = command.args
-    tg_id = message.from_user.id
-    username = message.from_user.username
-    first_name = message.from_user.first_name
-    
-    # --- СЦЕНАРИЙ А: Переход с лендинга лид-магнита ---
-    if args and args.startswith("preview_"):
-        preview_id = args.replace("preview_", "").strip()
-        user = get_or_create_user(tg_id, username, first_name, source_tag="landing")
-        
-        gen = DB_GENERATIONS.get(preview_id)
-        if not gen:
-            await message.answer(
-                "❌ К сожалению, срок хранения вашей временной сессии истек или ссылка недействительна.\n"
-                "Пожалуйста, загрузите изображение заново через наш сайт-сателлит."
-            )
-            return
-            
-        # Привязываем генерацию к авторизованному Telegram-пользователю
-        gen["user_id"] = tg_id
-        
-        await message.answer("⏳ Проверяю статус вашей карточки из лид-магнита... Сессия обнаружена.")
-        
-        if gen["status"] in ["uploaded", "preview_generating"]:
-            await message.answer("⚙️ Нейросеть в процессе сборки макета. Пожалуйста, подождите несколько секунд и отправьте команду /start повторно.")
-            return
-            
-        if gen["preview_photo_bytes"]:
-            photo_input = BufferedInputFile(gen["preview_photo_bytes"], filename="preview.jpg")
-            await message.answer_photo(
-                photo=photo_input,
-                caption=(
-                    f"👍 Это ваше бесплатное тестовое превью карточки [{gen['marketplace'].upper()}].\n\n"
-                    f"📝 Введенный контекст: *{gen['description_input']}*\n\n"
-                    "🔒 Чтобы убрать вотермарк, сгенерировать полный комплект из 4 продающих инфографик-слайдов в HD-качестве "
-                    "и извлечь структурированный SEO-текст, вам необходимо активировать подписку."
-                ),
-                parse_mode="Markdown"
-            )
-            # Вызов меню оплаты/подписки
-            await offer_subscription_paywall(message)
+    if not args.startswith("preview_"):
+        await message.answer("Некорректный параметр запуска.")
         return
 
-    # --- СЦЕНАРИЙ Б: Прямой трафик из Telegram-канала ---
-    elif args == "tg_channel" or (message.chat.type == "private" and not args):
-        source = "tg_channel" if args == "tg_channel" else "organic_bot"
-        user = get_or_create_user(tg_id, username, first_name, source_tag=source)
-        
+    preview_id = args.replace("preview_", "", 1)
+    item = DATA.get(preview_id)
+
+    if not item:
         await message.answer(
-            f"👋 Приветствуем, {first_name}! Вы перешли в ИИ-генератор *MarketGen AI*.\n\n"
-            "🎁 Вам начислен бонус: **1 ПОЛНОЦЕННАЯ ГЕНЕРАЦИЯ** карточки товара напрямую внутри чата!\n"
-            "Вы получите 4 слайда инфографики + полное готовое SEO-описание с LSI-ключами бесплатно.\n\n"
-            "👉 Чтобы воспользоваться бонусом, просто отправьте мне **ФОТОГРАФИЮ** товара одним сообщением, "
-            "а в тексте (подписи) к фото укажите характеристики товара своими словами.",
-            parse_mode="Markdown"
+            "Сессия не найдена. Возможно, сервис был перезапущен, и временные данные очищены."
         )
         return
 
-@dp.message(F.photo)
-async def handle_direct_photo_generation(message: Message):
-    """Обработка прямого сценария создания карточки через чат бота (Вход из Канала)."""
-    tg_id = message.from_user.id
-    user = get_or_create_user(tg_id, message.from_user.username, message.from_user.first_name)
-    
-    # 1. Проверка лимитов и подписки
-    if user["free_generations_left"] <= 0 and not user["is_subscribed"] and user["credits_left"] <= 0:
-        await message.answer("❌ Ваши бесплатные кредиты исчерпаны.")
-        await offer_subscription_paywall(message)
-        return
-        
-    description_text = message.caption
-    if not description_text or len(description_text.strip()) < 5:
+    if item.preview_bytes:
+        preview_photo = BufferedInputFile(item.preview_bytes, filename=f"{preview_id}_preview.jpg")
+        await message.answer_photo(
+            photo=preview_photo,
+            caption=(
+                f"Задача получена.\n"
+                f"Маркетплейс: {item.marketplace.title()}\n"
+                f"Статус: {item.status}"
+            ),
+        )
+
+    if item.status in {"uploaded", "analyzing"}:
         await message.answer(
-            "⚠️ Ошибка! Вы забыли добавить описание товара.\n"
-            "Пожалуйста, отправьте фото еще раз и **обязательно напишите в подписи к нему** информацию о товаре (материал, цвет, особенности)."
+            "Генерация еще выполняется. Откройте бота чуть позже."
         )
         return
-        
-    await message.answer("🚀 Запуск полноценной генерации пакета карточки через ProxyAPI (Flux + DeepSeek). Это займет около 20-30 секунд...")
-    
-    # Загрузка фото из серверов Telegram
-    photo_file = await bot.get_file(message.photo[-1].file_id)
-    photo_buffer = io.BytesIO()
-    await bot.download_file(photo_file.file_path, photo_buffer)
-    img_bytes = photo_buffer.getvalue()
-    
-    # Списание лимита
-    if user["free_generations_left"] > 0:
-        user["free_generations_left"] -= 1
-        is_paid = False
-    else:
-        user["credits_left"] -= 1
-        is_paid = True
-        
-    # Формируем сущность генерации
-    preview_id = str(uuid.uuid4())[:12]
-    DB_GENERATIONS[preview_id] = {
-        "preview_id": preview_id,
-        "user_id": tg_id,
-        "description_input": description_text,
-        "marketplace": "wildberries", # Значение по умолчанию для прямых запросов
-        "original_photo_bytes": img_bytes,
-        "status": "processing"
-    }
-    
-    # Вызов синхронной Pillow-генерации + ИИ
-    await generate_ai_bundle_task(preview_id, description_text, img_bytes, "wildberries")
-    gen = DB_GENERATIONS[preview_id]
-    
-    if gen["status"] == "full_ready" or gen["status"] == "preview_ready":
-        # Отправка HD-результата пользователю (в рамках MVP отдаем красивую инфографику)
-        final_photo = BufferedInputFile(gen["preview_photo_bytes"], filename="result.jpg")
+
+    if item.status == "failed":
+        await message.answer(
+            f"Генерация завершилась ошибкой: {item.error or 'неизвестная ошибка'}"
+        )
+        return
+
+    if item.final_image_bytes:
+        final_photo = BufferedInputFile(item.final_image_bytes, filename=f"{preview_id}_final.jpg")
         await message.answer_photo(
             photo=final_photo,
-            caption="🎉 Ваша полноценная карточка товара успешно сгенерирована ИИ без вотермарков!"
+            caption="Готово! Вот карточка-превью товара.",
         )
-        
-        # Отправка SEO-текста в копируемом Markdown блоке
-        if gen["seo_text"]:
-            await message.answer(f"📦 *Сгенерированное SEO-описание и LSI-ключи:*\n\n{gen['seo_text']}", parse_mode="Markdown")
-        else:
-            await message.answer(
-                "📦 *SEO-описание товара:*\n```markdown\n"
-                "Название: Премиум Чехол\n"
-                "Характеристики:\n- Материал: Силикон софт-тач\n- Защита камеры: Есть\n"
-                "Описание: Стильный аксессуар для защиты вашего смартфона от падений.\n"
-                "LSI: чехол, бампер, силиконовый, противоударный\n```",
-                parse_mode="Markdown"
-            )
-            
-        if user["free_generations_left"] == 0 and not user["is_subscribed"]:
-            await message.answer("💡 Ваш бесплатный лимит исчерпан. Для продолжения работы оформите подписку.")
-            await offer_subscription_paywall(message)
-    else:
-        await message.answer("❌ Произошла техническая ошибка на стороне нейросети ProxyAPI. Кредит не списан, попробуйте позже.")
-        if not is_paid:
-            user["free_generations_left"] += 1
-        else:
-            user["credits_left"] += 1
 
-# --- ПОДДЕРЖКА БЕСПЛАТНОГО ТЕКСТОВОГО РЕЖИМА ---
+    if item.seo_text:
+        chunks = textwrap.wrap(
+            item.seo_text,
+            width=3500,
+            break_long_words=False,
+            break_on_hyphens=False,
+        )
+        for chunk in chunks:
+            await message.answer(chunk)
+
+
+@dp.message(CommandStart())
+async def cmd_start_plain(message: Message):
+    text = (
+        "Привет! Это бот MarketGen AI.\n\n"
+        "Как это работает:\n"
+        "1. На сайте загрузите фото товара\n"
+        "2. Добавьте описание своими словами\n"
+        "3. Выберите Wildberries или Ozon\n"
+        "4. Получите результат здесь, в Telegram\n\n"
+        "Фото в бот тоже можно отправить — я сделаю тестовое preview."
+    )
+    await message.answer(text)
+
+
 @dp.message(Command("seo"))
-async def cmd_seo_only(message: Message):
-    """Безлимитный текстовый инструмент, который никогда не тратит платные графические кредиты."""
-    product_name = message.text.replace("/seo", "").strip()
-    if not product_name:
-        await message.answer("Пожалуйста, укажите название товара.\nПример: `/seo Кожаный кошелек`")
-        return
-        
-    await message.answer("⏳ Генерирую текстовый SEO-пакет...")
-    if ai_client:
-        try:
-            response = await ai_client.chat.completions.create(
-                model=OPENAI_MODEL_TEXT,
-                messages=[
-                    {"role": "system", "content": "Ты копирайтер маркетплейсов. Напиши SEO-описание товара, выдели характеристики и LSI."},
-                    {"role": "user", "content": product_name}
-                ],
-                temperature=0.4
-            )
-            await message.answer(response.choices[0].message.content, parse_mode="Markdown")
-            return
-        except Exception as e:
-            logger.error(f"Text mode error: {e}")
-            
-    # Заглушка, если шлюз ProxyAPI недоступен
+async def cmd_seo(message: Message):
     await message.answer(
-        f"📝 *SEO Результат для:* {product_name}\n\n"
-        "• *Заголовок:* Стильный товар для маркетплейсов\n"
-        "• *Ключевые слова:* купить, WB, Ozon, топ\n"
-        "• *Описание:* Отличное качество по доступной цене.",
-        parse_mode="Markdown"
+        "Команда /seo больше не является основным сценарием.\n"
+        "Теперь генерация работает корректно только в связке: фото + описание + marketplace через сайт."
     )
 
-# ---------------------------------------------------------------------------
-# 7. СИСТЕМА МОНЕТИЗАЦИИ: TELEGRAM STARS PAYWALL FLOW
-# ---------------------------------------------------------------------------
-async def offer_subscription_paywall(message: Message):
-    """Вывод коммерческого инвойса на оплату подписки через Telegram Stars."""
-    tg_id = message.from_user.id
-    user = DB_USERS.get(tg_id, {"is_subscribed": False})
-    
-    # 600 звезд для первой покупки, 500 для продления
-    price_amount = 500 if user.get("is_subscribed") else 600
-    
-    await message.answer(
-        "💳 *ДОСТУП К MARKETGEN AI ПРЕМИУМ*\n\n"
-        "Оформите подписку за Telegram Stars и получите:\n"
-        "• **30 полнофункциональных генераций** карточек в месяц.\n"
-        "• Пакет из 4 слайдов инфографики (Слайд-обложка, Преимущества, Детали, СТА).\n"
-        "• Полное удаление вотермарков и HD качество.\n"
-        "• 🔗 Индивидуальная инвайт-ссылка в **Закрытый приватный Telegram-канал** с кейсами и схемами продаж!",
-        parse_mode="Markdown"
+
+@dp.message(lambda message: bool(message.photo))
+async def handle_photo(message: Message):
+    photo = message.photo[-1]
+    file = await bot.get_file(photo.file_id)
+    file_bytes_io = io.BytesIO()
+    await bot.download_file(file.file_path, destination=file_bytes_io)
+
+    preview_bytes = make_preview(file_bytes_io.getvalue(), marketplace="ozon")
+    result = BufferedInputFile(preview_bytes, filename="preview.jpg")
+
+    await message.answer_photo(
+        photo=result,
+        caption=(
+            "Готово! Вот тестовое preview.\n"
+            "Для полноценной карточки и SEO-описания используйте загрузку через сайт."
+        ),
     )
-    
-    # Отправка официального инвойса платежной системы Telegram Stars
-    await bot.send_invoice(
-        chat_id=message.chat.id,
-        title="MarketGen Premium Доступ",
-        description="Подписка на 30 дней и 30 кредитов генерации инфографики.",
-        payload=f"sub_payment_{tg_id}_{price_amount}",
-        provider_token="", # Для Telegram Stars provider_token должен оставаться ПУСТЫМ
-        currency="XTR",   # Код валюты Telegram Stars
-        prices=[LabeledPrice(label="Активация подписки", amount=price_amount)]
-    )
-
-@dp.pre_checkout_query()
-async def process_pre_checkout(pre_checkout_query: PreCheckoutQuery):
-    """Валидация платежа перед окончательным списанием Звезд."""
-    await bot.answer_pre_checkout_query(pre_checkout_query.id, ok=True)
-
-@dp.message(F.content_type == ContentType.SUCCESSFUL_PAYMENT)
-async def process_successful_payment(message: Message):
-    """Обработчик успешного завершения транзакции платежной системой Telegram."""
-    tg_id = message.from_user.id
-    user = get_or_create_user(tg_id, message.from_user.username, message.from_user.first_name)
-    
-    payment_info = message.successful_payment
-    
-    # Начисление платных опций согласно бизнес-логике
-    user["is_subscribed"] = True
-    user["subscription_expires_at"] = datetime.now(timezone.utc) + timedelta(days=30)
-    user["credits_left"] += 30
-    
-    # Фиксация финансовой транзакции в таблице платежей БД
-    pay_id = payment_info.telegram_payment_charge_id
-    DB_PAYMENTS[pay_id] = {
-        "payment_id": pay_id,
-        "user_id": tg_id,
-        "amount_stars": payment_info.total_amount,
-        "item_type": "subscription_first" if payment_info.total_amount == 600 else "subscription_renewal",
-        "status": "completed",
-        "created_at": datetime.now(timezone.utc)
-    }
-    
-    # Генерация одноразовой ссылки-приглашения в закрытый канал сателлит
-    try:
-        # PRIVATE_CHANNEL_ID передается через настройки платформы Railway
-        channel_id = os.getenv("PRIVATE_CHANNEL_ID", "-100123456789")
-        invite_link = await bot.create_chat_invite_link(chat_id=channel_id, member_limit=1)
-        link_text = f"🔗 Ваша уникальная ссылка для входа в приватный канал: {invite_link.invite_link}"
-    except Exception as e:
-        logger.error(f"Failed to generate invite link: {e}")
-        link_text = "🔗 Добро пожаловать в наше сообщество! Напишите администратору для добавления в приватный канал."
-
-    await message.answer(
-        "🎉 *ОПЛАТА ПРОШЛА УСПЕШНО!*\n\n"
-        "👑 Вам выдан статус **Премиум** на 30 дней.\n"
-        "⚙️ Начислено: **30 кредитов** для создания HD-карточек маркетплейсов.\n\n"
-        f"{link_text}",
-        parse_mode="Markdown"
-    )
-
-# ---------------------------------------------------------------------------
-# 8. ПОРТЫ, КОРРЕКТНЫЙ СТАРТ И ЗАВЕРШЕНИЕ СЕССИЙ FASTAPI + AIOGRAM
-# ---------------------------------------------------------------------------
-@app.post("/telegram/webhook")
-async def telegram_webhook(request: Request, x_telegram_bot_api_secret_token: Optional[str] = Header(default=None)):
-    if x_telegram_bot_api_secret_token != TELEGRAM_WEBHOOK_SECRET:
-        raise HTTPException(status_code=403, detail="forbidden")
-    
-    data = await request.json()
-    update = types.Update.model_validate(data, context={"bot": bot})
-    await dp.feed_update(bot, update)
-    return {"ok": True}
-
-@app.on_event("startup")
-async def on_startup():
-    webhook_url = f"{APP_BASE_URL}/telegram/webhook"
-    await bot.set_webhook(webhook_url, secret_token=TELEGRAM_WEBHOOK_SECRET)
-    logger.info(f"Связка Webhook успешно установлена на адрес: {webhook_url}")
-
-@app.on_event("shutdown")
-async def on_shutdown():
-    await bot.delete_webhook(drop_pending_updates=False)
-    await bot.session.close()
-    logger.info("Сессии Webhook и Bot закрыты корректно.")
-
-if __name__ == "__main__":
-    import uvicorn
-    # Динамический биндинг порта Railway
-    port = int(os.getenv("PORT", 8080))
-    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
