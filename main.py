@@ -16,6 +16,12 @@ from aiogram.types import Message, BufferedInputFile, Update
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from openai import AsyncOpenAI
 
+ai_client = AsyncOpenAI(
+    api_key=PROXY_API_KEY,
+    base_url="https://api.proxyapi.ru/openai/v1"
+)
+
+
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -88,42 +94,56 @@ async def cmd_start(message: Message):
 
 @dp.message(Command("seo"))
 async def cmd_seo(message: Message):
-    # 1. Берем текст, который пользователь написал после команды /seo
-    # Например: "/seo кожаный кошелек" -> товар будет "кожаный кошелек"
-    product_name = message.text.replace("/seo", "").strip()
+    product_name = message.text.replace("/seo", "", 1).strip()
 
     if not product_name:
         await message.answer(
-            "Пожалуйста, укажите название товара после команды.\n"
-            "Пример: `/seo Кожаный мужской кошелек`"
+            "Пожалуйста, укажите товар после команды.\n"
+            "Пример: /seo Мужской кожаный кошелек"
         )
         return
 
-    await message.answer(f"⏳ Генерирую SEO-описание для товара «{product_name}»... Пожалуйста, подождите.")
+    await message.answer(
+        f"⏳ Генерирую SEO-описание для товара: {product_name}"
+    )
 
     try:
-        # 2. Подключаемся к ИИ, используя ваш ключ из Railway
         ai_client = AsyncOpenAI(
             api_key=PROXY_API_KEY,
-            base_url="https://api.proxyapi.ru" # Адрес шлюза ProxyAPI
+            base_url="https://api.proxyapi.ru/openai/v1"
         )
 
-        # 3. Отправляем запрос нейросети
         response = await ai_client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": "Ты профессиональный копирайтер для маркетплейсов (Wildberries, Ozon). Твоя задача — составить продающее SEO-описание товара с ключевыми словами и LSI."},
-                {"role": "user", "content": f"Напиши SEO-описание для товара: {product_name}. Структурируй ответ: Название, Характеристики (3-4 пункта), Продающее описание, Блок LSI-ключей."}
-            ]
+                {
+                    "role": "system",
+                    "content": (
+                        "Ты профессиональный копирайтер для маркетплейсов. "
+                        "Пиши по-русски. "
+                        "Структура ответа: "
+                        "1) Название, "
+                        "2) Характеристики, "
+                        "3) Продающее описание, "
+                        "4) SEO-ключи."
+                    )
+                },
+                {
+                    "role": "user",
+                    "content": f"Сделай SEO-описание для товара: {product_name}"
+                }
+            ],
+            temperature=0.7
         )
 
-        # 4. Забираем готовый текст и отправляем пользователю
         ai_text = response.choices[0].message.content
         await message.answer(ai_text)
 
     except Exception as e:
         print(f"Ошибка ИИ: {e}")
-        await message.answer("К сожалению, произошла ошибка при обращении к ИИ. Попробуйте позже.")
+        await message.answer(
+            "К сожалению, произошла ошибка при обращении к ИИ. Попробуйте позже."
+        )
 
 
 
