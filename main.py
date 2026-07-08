@@ -105,7 +105,7 @@ async def cmd_seo(message: Message):
         # 2. Подключаемся к ИИ, используя ваш ключ из Railway
         ai_client = AsyncOpenAI(
             api_key=PROXY_API_KEY,
-            base_url="https://api.proxyapi.ru/v1" # Адрес шлюза ProxyAPI
+            base_url="https://api.proxyapi.ru" # Адрес шлюза ProxyAPI
         )
 
         # 3. Отправляем запрос нейросети
